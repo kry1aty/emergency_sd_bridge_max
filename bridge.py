@@ -958,8 +958,8 @@ class MaxClient:
             logger.error("Сбой установки вебхука MAX API: %s", e)
         return False
 
-    async def delete_all_subscriptions(self) -> bool:
-        """Удаление всех вебхук-подписок в MAX API для возврата на Long Polling."""
+    async def delete_bridge_subscriptions(self, target_url: Optional[str] = None) -> bool:
+        """Удаление ТОЛЬКО собственных вебхуков моста в MAX API (не трогая боевой вебхук ЭЛМЫ!)."""
         api_url = f"{self.base_url}/subscriptions"
         try:
             async with httpx.AsyncClient(timeout=15.0, verify=False) as client:
@@ -967,15 +967,22 @@ class MaxClient:
                 if resp.status_code == 200:
                     subs = resp.json().get("subscriptions", [])
                     for sub in subs:
-                        sub_url = sub.get("url")
-                        if sub_url:
+                        sub_url = sub.get("url", "")
+                        # Удаляем ТОЛЬКО если это вебхук нашего моста
+                        is_our_webhook = False
+                        if target_url and target_url in sub_url:
+                            is_our_webhook = True
+                        elif any(marker in sub_url.lower() for marker in ("/webhook/max", "bothost", "emergency", "bridge")):
+                            is_our_webhook = True
+
+                        if is_our_webhook:
                             del_resp = await client.delete(f"{api_url}?url={sub_url}", headers=self._headers())
-                            logger.info("Удалена вебхук-подписка MAX: %s -> %s", sub_url, del_resp.status_code)
-                    if subs:
-                        logger.info("🟢 Все вебхуки MAX очищены, активен режим Long Polling.")
+                            logger.info("Удален временный вебхук аварийного моста: %s -> %s", sub_url, del_resp.status_code)
+                        else:
+                            logger.info("🛡️ Сохранен существующий вебхук сторонней системы (ELMA365 / Прод): %s", sub_url)
                     return True
         except Exception as e:
-            logger.error("Ошибка очистки подписок MAX API: %s", e)
+            logger.error("Ошибка при проверке вебхук-подписок MAX API: %s", e)
         return False
 
 
@@ -1696,9 +1703,9 @@ async def main():
             await asyncio.sleep(3600)
 
     else:
-        # Режим Long Polling: гарантированно очищаем любые старые вебхуки
-        logger.info("[POLLING] Гарантированная очистка старых вебхуков для работы в режиме Long Polling...")
-        await max_client.delete_all_subscriptions()
+        # Режим Long Polling: безопасно очищаем только собственные вебхуки моста, сохраняя вебхук ЭЛМЫ
+        logger.info("[POLLING] Проверка вебхуков моста для работы в режиме Long Polling...")
+        await max_client.delete_bridge_subscriptions()
         await tg_client.delete_webhook()
 
         logger.info("🟢 Запущен параллельный Long Polling для MAX и Telegram...")
