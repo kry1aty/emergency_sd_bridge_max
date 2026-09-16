@@ -1,0 +1,34 @@
+# Секреты, переменные окружения и ключи
+.env
+.env.*
+!.env.example
+*.env.local
+
+# Локальные базы данных SQLite (чтобы не заливать личные данные на GitHub)
+*.db
+*.db-wal
+*.db-shm
+*.sqlite3
+
+# Выгрузки и отчеты
+*.csv
+*.json
+!package.json
+
+# Кэш Python и виртуальные окружения
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.venv/
+venv/
+ENV/
+
+# Редакторы и IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Логи
+*.log
