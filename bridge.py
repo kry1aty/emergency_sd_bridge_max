@@ -355,16 +355,23 @@ class Storage:
                 "resolution": None,
             }
 
-    def record_first_response(self, ticket_id: int, operator_name: str) -> Optional[Dict[str, Any]]:
+    def record_first_response(self, ticket_id_or_user_id: int, operator_name: str) -> Optional[Dict[str, Any]]:
         now_dt = datetime.now(timezone.utc)
         now_str = now_dt.strftime("%Y-%m-%d %H:%M:%S")
         with sqlite3.connect(self.db_path) as conn:
             conn.row_factory = sqlite3.Row
-            cursor = conn.execute("SELECT * FROM tickets WHERE id = ?", (ticket_id,))
+            cursor = conn.execute("SELECT * FROM tickets WHERE id = ?", (ticket_id_or_user_id,))
             row = cursor.fetchone()
+            if not row:
+                cursor = conn.execute(
+                    "SELECT * FROM tickets WHERE max_user_id = ? AND status != 'CLOSED' ORDER BY id DESC LIMIT 1",
+                    (ticket_id_or_user_id,)
+                )
+                row = cursor.fetchone()
             if not row or row["first_response_at"]:
                 return None
 
+            ticket_id = row["id"]
             created_str = row["created_at"]
             try:
                 created_dt = datetime.strptime(created_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
@@ -672,6 +679,39 @@ class TelegramClient:
                 logger.error("Ошибка отправки документа в Telegram: %s -> %s", resp.status_code, resp.text)
         return None
 
+    async def send_video(
+        self,
+        chat_id: int,
+        video_bytes: bytes,
+        caption: str = "",
+        filename: str = "video.mp4",
+        message_thread_id: Optional[int] = None,
+    ) -> Optional[int]:
+        """Отправить видеозапись в Telegram с нативным видеоплеером."""
+        url = f"{self.base_url}/sendVideo"
+        data = {
+            "chat_id": str(chat_id),
+            "caption": caption,
+            "parse_mode": "HTML",
+            "supports_streaming": "true",
+        }
+        if message_thread_id:
+            data["message_thread_id"] = str(message_thread_id)
+        files = {"video": (filename, video_bytes, "video/mp4")}
+        try:
+            async with httpx.AsyncClient(timeout=60.0, verify=False) as client:
+                resp = await client.post(url, data=data, files=files)
+                if resp.status_code == 200 and resp.json().get("ok"):
+                    self.last_error = ""
+                    return resp.json()["result"]["message_id"]
+                else:
+                    self.last_error = resp.text
+                    logger.error("Ошибка отправки видео в Telegram: %s -> %s", resp.status_code, resp.text)
+        except Exception as e:
+            self.last_error = str(e)
+            logger.error("Исключение при send_video в Telegram: %s", e)
+        return None
+
     async def send_voice(
         self,
         chat_id: int,
@@ -932,6 +972,26 @@ class MaxClient:
         logger.error("Не удалось доставить сообщение в MAX после %d попыток: %s", max_attempts, last_error)
         return False, last_error
 
+    async def get_video_url(self, video_token: str) -> Optional[str]:
+        """Получить прямой URL видеозаписи из MAX API по video_token."""
+        url = f"{self.base_url}/videos/{video_token}"
+        try:
+            async with httpx.AsyncClient(verify=False, timeout=15.0) as client:
+                resp = await client.get(url, headers=self._headers())
+                if resp.status_code == 200:
+                    data = resp.json()
+                    urls = data.get("urls") or {}
+                    for q in ("mp4_720", "mp4_1080", "mp4_480", "mp4_360", "mp4_240", "mp4"):
+                        if urls.get(q):
+                            return urls[q]
+                    if data.get("url"):
+                        return data["url"]
+                else:
+                    logger.warning("MAX videos API: %s -> %s", resp.status_code, resp.text)
+        except Exception as e:
+            logger.error("Ошибка при получении видео из MAX API (%s): %s", video_token, e)
+        return None
+
     async def download_file(self, url: str) -> Optional[bytes]:
         """Скачать вложение из MAX."""
         try:
@@ -1081,8 +1141,11 @@ async def process_max_update(up: dict):
 
     # Подготовка списка вложений
     for att in attachments:
+        att_type = att.get("type")
         p = att.get("payload") or {}
         file_url = p.get("url") or p.get("download_url") or p.get("file_url") or ""
+        if att_type == "video" and not file_url and p.get("token"):
+            file_url = await max_client.get_video_url(p["token"])
         if not file_url and p.get("token"):
             file_url = f"{MAX_API_BASE_URL}/files/{p.get('token')}"
         if file_url:
@@ -1095,18 +1158,36 @@ async def process_max_update(up: dict):
             att_type = att.get("type")
             p = att.get("payload") or {}
             file_url = p.get("url") or p.get("download_url") or p.get("file_url") or ""
+            if att_type == "video" and not file_url and p.get("token"):
+                file_url = await max_client.get_video_url(p["token"])
             if not file_url and p.get("token"):
                 file_url = f"{MAX_API_BASE_URL}/files/{p.get('token')}"
 
             if file_url:
                 file_bytes = await max_client.download_file(file_url)
                 if file_bytes:
-                    filename = p.get("name") or "file.bin"
+                    if att_type == "video" or "video" in str(p.get("type", "")):
+                        token_part = str(p.get("token") or "")[:8]
+                        filename = p.get("name") or (f"video_{token_part}.mp4" if token_part else "video.mp4")
+                        if not any(filename.lower().endswith(ext) for ext in (".mp4", ".mov", ".avi", ".mkv", ".webm")):
+                            filename += ".mp4"
+                    else:
+                        filename = p.get("name") or "file.bin"
                     fn_lower = filename.lower()
+
                     if att_type == "image":
                         m_id = await tg_client.send_photo(
                             TG_CHAT_ID, file_bytes, caption=full_text, filename=filename, message_thread_id=target_tid
                         )
+                    elif att_type == "video" or fn_lower.endswith((".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v")):
+                        m_id = await tg_client.send_video(
+                            TG_CHAT_ID, file_bytes, caption=full_text, filename=filename, message_thread_id=target_tid
+                        )
+                        if not m_id:
+                            # Фолбэк на отправку документом с правильным именем и расширением .mp4
+                            m_id = await tg_client.send_document(
+                                TG_CHAT_ID, file_bytes, filename=filename, caption=full_text, message_thread_id=target_tid
+                            )
                     elif att_type == "audio" or fn_lower.endswith((".ogg", ".oga", ".opus")):
                         m_id = await tg_client.send_voice(
                             TG_CHAT_ID, file_bytes, caption=full_text, message_thread_id=target_tid
@@ -1497,11 +1578,20 @@ async def process_telegram_update(up: dict):
     )
 
     if success:
-        # Фиксация метрики First Response (RT)
-        active_ticket = storage.record_first_response(max_user_id, op_name)
-        if active_ticket and active_ticket.get("rt_seconds") is not None and active_ticket.get("status") == "IN_PROGRESS":
-            t_num = active_ticket["ticket_number"]
-            rt_disp = format_duration(active_ticket.get("rt_seconds"))
+        # Поиск активной заявки и фиксация первого ответа (RT)
+        target_ticket = None
+        if msg_thread_id:
+            target_ticket = storage.get_active_ticket_by_thread(msg_thread_id)
+        if not target_ticket:
+            target_ticket = storage.get_active_ticket(max_user_id)
+
+        first_resp_ticket = None
+        if target_ticket and not target_ticket.get("first_response_at"):
+            first_resp_ticket = storage.record_first_response(target_ticket["id"], op_name)
+
+        if first_resp_ticket and first_resp_ticket.get("rt_seconds") is not None and first_resp_ticket.get("status") == "IN_PROGRESS":
+            t_num = first_resp_ticket["ticket_number"]
+            rt_disp = format_duration(first_resp_ticket.get("rt_seconds"))
             t_name = storage.get_topic_name_by_thread(msg_thread_id) if msg_thread_id else max_user_name
             topic_link = get_topic_link(TG_CHAT_ID, msg_thread_id, t_name)
 
@@ -1530,7 +1620,12 @@ async def process_telegram_update(up: dict):
                 await asyncio.sleep(1.5)
                 await tg_client.delete_message(TG_CHAT_ID, msg_id)
             asyncio.create_task(_auto_delete(confirm_id))
+
         # Сохраняем в историю
+        logged_ticket_id = (
+            first_resp_ticket["id"] if first_resp_ticket
+            else (target_ticket["id"] if target_ticket else None)
+        )
         storage.log_message(
             direction="OPERATOR_TO_CLIENT",
             max_user_id=max_user_id,
@@ -1540,7 +1635,7 @@ async def process_telegram_update(up: dict):
             has_attachments=has_media,
             attachment_info=", ".join(media_info),
             tg_message_id=msg.get("message_id"),
-            ticket_id=active_ticket["id"] if active_ticket else None,
+            ticket_id=logged_ticket_id,
         )
     else:
         err_hint = f"\n<code>{err_msg[:200]}</code>" if err_msg else ""
